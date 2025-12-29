@@ -1,153 +1,160 @@
-let token = "";
+/**
+ * Cloudflare Worker: GitHub Raw Proxy with Auth
+ * 2025 Refactored Version
+ */
+
 export default {
-	async fetch(request, env) {
-		const url = new URL(request.url);
-		if (url.pathname !== '/') {
-			let githubRawUrl = 'https://raw.githubusercontent.com';
-			if (new RegExp(githubRawUrl, 'i').test(url.pathname)) {
-				githubRawUrl += url.pathname.split(githubRawUrl)[1];
-			} else {
-				if (env.GH_NAME) {
-					githubRawUrl += '/' + env.GH_NAME;
-					if (env.GH_REPO) {
-						githubRawUrl += '/' + env.GH_REPO;
-						if (env.GH_BRANCH) githubRawUrl += '/' + env.GH_BRANCH;
-					}
-				}
-				githubRawUrl += url.pathname;
-			}
-			//console.log(githubRawUrl);
-			
-			// 初始化请求头
-			const headers = new Headers();
-			let authTokenSet = false; // 标记是否已经设置了认证token
-			
-			// 检查TOKEN_PATH特殊路径鉴权
-			if (env.TOKEN_PATH) {
-				const 需要鉴权的路径配置 = await ADD(env.TOKEN_PATH);
-				// 将路径转换为小写进行比较，防止大小写绕过
-				const normalizedPathname = decodeURIComponent(url.pathname.toLowerCase());
+    async fetch(request, env) {
+        const url = new URL(request.url);
 
-				//检测访问路径是否需要鉴权
-				for (const pathConfig of 需要鉴权的路径配置) {
-					const configParts = pathConfig.split('@');
-					if (configParts.length !== 2) {
-						// 如果格式不正确，跳过这个配置
-						continue;
-					}
+        // --- 1. 首页处理 (Root Path) ---
+        if (url.pathname === '/') {
+            const envKey = env.URL302 ? 'URL302' : (env.URL ? 'URL' : null);
+            if (envKey) {
+                const URLs = await parseEnvList(env[envKey]);
+                const targetURL = URLs[Math.floor(Math.random() * URLs.length)];
+                return envKey === 'URL302' 
+                    ? Response.redirect(targetURL, 302) 
+                    : fetch(new Request(targetURL, request));
+            }
+            // 默认显示 Nginx 伪装页
+            return new Response(nginxTemplate(), {
+                headers: { 'Content-Type': 'text/html; charset=UTF-8' },
+            });
+        }
 
-					const [requiredToken, pathPart] = configParts;
-					const normalizedPath = '/' + pathPart.toLowerCase().trim();
+        // --- 2. 构建目标 GitHub URL ---
+        let githubRawUrl = 'https://raw.githubusercontent.com';
+        
+        // 检查路径是否直接包含 raw.githubusercontent.com (兼容旧逻辑)
+        // 注意：正则中 . 需要转义，且不再使用 new RegExp 避免开销
+        const rawUrlRegex = /https:\/\/raw\.githubusercontent\.com/i;
+        if (rawUrlRegex.test(url.pathname)) {
+            githubRawUrl += url.pathname.split(rawUrlRegex)[1];
+        } else {
+            // 自动拼接环境变量
+            const parts = [];
+            if (env.GH_NAME) parts.push(env.GH_NAME);
+            if (env.GH_REPO) parts.push(env.GH_REPO);
+            if (env.GH_BRANCH) parts.push(env.GH_BRANCH);
+            
+            // 拼接基础路径
+            if (parts.length > 0) {
+                githubRawUrl += '/' + parts.join('/');
+            }
+            // 追加请求路径 (移除开头的 / 防止双斜杠，如果 githubRawUrl 结尾已有 /)
+            githubRawUrl += url.pathname;
+        }
 
-					// 精确匹配路径段，防止部分匹配绕过
-					const pathMatches = normalizedPathname === normalizedPath ||
-						normalizedPathname.startsWith(normalizedPath + '/');
+        // 修复潜在的双斜杠问题 (https://... 之后的)
+        githubRawUrl = githubRawUrl.replace(/([^:]\/)\/+/g, "$1");
 
-					if (pathMatches) {
-						const providedToken = url.searchParams.get('token');
-						if (!providedToken) {
-							return new Response('TOKEN不能为空', { status: 400 });
-						}
+        // --- 3. 鉴权逻辑 ---
+        const headers = new Headers();
+        let finalToken = "";
+        let isAuthDone = false;
+        const userProvidedToken = url.searchParams.get('token');
 
-						if (providedToken !== requiredToken.trim()) {
-							return new Response('TOKEN错误', { status: 403 });
-						}
+        // A. 检查 TOKEN_PATH (特定路径鉴权)
+        if (env.TOKEN_PATH) {
+            const pathConfigs = await parseEnvList(env.TOKEN_PATH);
+            const normalizedPathname = decodeURIComponent(url.pathname.toLowerCase());
 
-						// token验证成功，使用GH_TOKEN作为GitHub请求的token
-						if (!env.GH_TOKEN) {
-							return new Response('服务器GitHub TOKEN配置错误', { status: 500 });
-						}
-						headers.append('Authorization', `token ${env.GH_TOKEN}`);
-						authTokenSet = true;
-						break; // 找到匹配的路径配置后退出循环
-					}
-				}
-			}
-			
-			// 如果TOKEN_PATH没有设置认证，使用默认token逻辑
-			if (!authTokenSet) {
-				if (env.GH_TOKEN && env.TOKEN) {
-					if (env.TOKEN == url.searchParams.get('token')) token = env.GH_TOKEN || token;
-					else token = url.searchParams.get('token') || token;
-				} else token = url.searchParams.get('token') || env.GH_TOKEN || env.TOKEN || token;
-				
-				const githubToken = token;
-				//console.log(githubToken);
-				if (!githubToken || githubToken == '') {
-					return new Response('TOKEN不能为空', { status: 400 });
-				}
-				headers.append('Authorization', `token ${githubToken}`);
-			}
+            for (const config of pathConfigs) {
+                const splitIndex = config.indexOf('@');
+                if (splitIndex === -1) continue;
 
-			// 发起请求
-			const response = await fetch(githubRawUrl, { headers });
+                const requiredToken = config.substring(0, splitIndex).trim();
+                const pathPart = config.substring(splitIndex + 1).trim();
+                const normalizedConfigPath = '/' + pathPart.toLowerCase().replace(/^\/+/, ''); // 确保以 / 开头
 
-			// 检查请求是否成功 (状态码 200 到 299)
-			if (response.ok) {
-				return new Response(response.body, {
-					status: response.status,
-					headers: response.headers
-				});
-			} else {
-				const errorText = env.ERROR || '无法获取文件，检查路径或TOKEN是否正确。';
-				// 如果请求不成功，返回适当的错误响应
-				return new Response(errorText, { status: response.status });
-			}
+                // 路径匹配逻辑
+                if (normalizedPathname === normalizedConfigPath || 
+                    normalizedPathname.startsWith(normalizedConfigPath + '/')) {
+                    
+                    if (!userProvidedToken) return new Response('TOKEN不能为空', { status: 400 });
+                    if (userProvidedToken !== requiredToken) return new Response('TOKEN错误', { status: 403 });
+                    if (!env.GH_TOKEN) return new Response('服务器GitHub TOKEN配置错误', { status: 500 });
 
-		} else {
-			const envKey = env.URL302 ? 'URL302' : (env.URL ? 'URL' : null);
-			if (envKey) {
-				const URLs = await ADD(env[envKey]);
-				const URL = URLs[Math.floor(Math.random() * URLs.length)];
-				return envKey === 'URL302' ? Response.redirect(URL, 302) : fetch(new Request(URL, request));
-			}
-			//首页改成一个nginx伪装页
-			return new Response(await nginx(), {
-				headers: {
-					'Content-Type': 'text/html; charset=UTF-8',
-				},
-			});
-		}
-	}
+                    finalToken = env.GH_TOKEN;
+                    isAuthDone = true;
+                    break;
+                }
+            }
+        }
+
+        // B. 默认鉴权 (如果未命中 TOKEN_PATH)
+        if (!isAuthDone) {
+            // 逻辑：
+            // 1. 如果 env.TOKEN 存在且等于用户传的 token -> 使用 env.GH_TOKEN (隐藏真实 token)
+            // 2. 否则使用用户传的 token
+            // 3. 如果用户没传，尝试使用 env.GH_TOKEN 或 env.TOKEN 作为默认值
+            
+            if (env.TOKEN && userProvidedToken === env.TOKEN) {
+                finalToken = env.GH_TOKEN || env.TOKEN;
+            } else {
+                finalToken = userProvidedToken || env.GH_TOKEN || env.TOKEN;
+            }
+
+            if (!finalToken) {
+                return new Response('TOKEN不能为空', { status: 400 });
+            }
+        }
+
+        // 设置 Authorization 头
+        if (finalToken) {
+            headers.append('Authorization', `token ${finalToken}`);
+        }
+
+        // --- 4. 发起请求 ---
+        try {
+            const response = await fetch(githubRawUrl, { 
+                method: request.method,
+                headers: headers 
+            });
+
+            if (response.ok) {
+                return new Response(response.body, {
+                    status: response.status,
+                    headers: response.headers
+                });
+            } else {
+                const errorText = env.ERROR || '无法获取文件，检查路径或TOKEN是否正确。';
+                return new Response(errorText, { status: response.status });
+            }
+        } catch (e) {
+            return new Response('服务器内部错误: ' + e.message, { status: 500 });
+        }
+    }
 };
 
-async function nginx() {
-	const text = `
-	<!DOCTYPE html>
-	<html>
-	<head>
-	<title>Welcome to nginx!</title>
-	<style>
-		body {
-			width: 35em;
-			margin: 0 auto;
-			font-family: Tahoma, Verdana, Arial, sans-serif;
-		}
-	</style>
-	</head>
-	<body>
-	<h1>Welcome to nginx!</h1>
-	<p>If you see this page, the nginx web server is successfully installed and
-	working. Further configuration is required.</p>
-	
-	<p>For online documentation and support please refer to
-	<a href="http://nginx.org/">nginx.org</a>.<br/>
-	Commercial support is available at
-	<a href="http://nginx.com/">nginx.com</a>.</p>
-	
-	<p><em>Thank you for using nginx.</em></p>
-	</body>
-	</html>
-	`
-	return text;
+// 辅助函数：解析环境变量列表 (替代原有的 ADD)
+async function parseEnvList(envStr) {
+    if (!envStr) return [];
+    // 将换行、制表符、引号替换为逗号，然后分割，过滤空项
+    return envStr.replace(/[\s"'`]+/g, ',').split(',').filter(item => item.length > 0);
 }
 
-async function ADD(envadd) {
-	var addtext = envadd.replace(/[	|"'\r\n]+/g, ',').replace(/,+/g, ',');	// 将空格、双引号、单引号和换行符替换为逗号
-	//console.log(addtext);
-	if (addtext.charAt(0) == ',') addtext = addtext.slice(1);
-	if (addtext.charAt(addtext.length - 1) == ',') addtext = addtext.slice(0, addtext.length - 1);
-	const add = addtext.split(',');
-	//console.log(add);
-	return add;
+// 辅助函数：Nginx 伪装页面
+function nginxTemplate() {
+    return `
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <title>Welcome to nginx!</title>
+    <style>
+        body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-serif; }
+    </style>
+    </head>
+    <body>
+    <h1>Welcome to nginx!</h1>
+    <p>If you see this page, the nginx web server is successfully installed and
+    working. Further configuration is required.</p>
+    <p>For online documentation and support please refer to
+    <a href="http://nginx.org/">nginx.org</a>.<br/>
+    Commercial support is available at
+    <a href="http://nginx.com/">nginx.com</a>.</p>
+    <p><em>Thank you for using nginx.</em></p>
+    </body>
+    </html>`;
 }
